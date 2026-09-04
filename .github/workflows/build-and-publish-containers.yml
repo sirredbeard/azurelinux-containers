@@ -1,0 +1,248 @@
+# Scan the repo for Dockerfiles / Containerfiles, build OCI images, push to GHCR,
+# prune each package to the newest 3 tagged builds.
+name: Build and publish containers
+
+on:
+  schedule:
+    # Monday 06:15 UTC. Floating bases such as mcr ... 11.0-preview refresh here.
+    - cron: "15 6 * * 1"
+  push:
+    branches:
+      - main
+    paths:
+      - "**/Dockerfile"
+      - "**/Containerfile"
+      - ".github/workflows/build-and-publish-containers.yml"
+  pull_request:
+    paths:
+      - "**/Dockerfile"
+      - "**/Containerfile"
+      - ".github/workflows/build-and-publish-containers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-containers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Discover container definitions
+    runs-on: ubuntu-24.04
+    outputs:
+      matrices: ${{ steps.discover.outputs.matrices }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Find Dockerfiles and Containerfiles
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(".")
+          items = []
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              if path.name not in {"Dockerfile", "Containerfile"}:
+                  continue
+              if ".git" in path.parts:
+                  continue
+
+              parent = path.parent
+              if parent == root:
+                  name = os.environ.get("GITHUB_REPOSITORY", "azurelinux-containers").split("/")[-1]
+                  context = "."
+                  file_path = path.name
+              else:
+                  name = parent.name
+                  context = parent.as_posix()
+                  file_path = f"{context}/{path.name}"
+
+              items.append(
+                  {
+                      "name": name,
+                      "context": context,
+                      "file": file_path,
+                  }
+              )
+
+          seen = set()
+          unique = []
+          for item in items:
+              if item["name"] in seen:
+                  continue
+              seen.add(item["name"])
+              unique.append(item)
+
+          if not unique:
+              raise SystemExit("No Dockerfile or Containerfile found.")
+
+          matrices = {"include": unique}
+          print(json.dumps(matrices, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrices=" + json.dumps(matrices, separators=(",", ":")) + "\n")
+          PY
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: discover
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrices) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Image metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_lc='${{ github.repository_owner }}'
+          owner_lc="${owner_lc,,}"
+          name='${{ matrix.name }}'
+          registry="ghcr.io/${owner_lc}/${name}"
+          sha_tag="sha-${GITHUB_SHA::12}"
+          utc_tag="utc-$(date -u +%Y%m%d-%H%M%S)"
+          {
+            echo "registry=${registry}"
+            echo "sha_tag=${sha_tag}"
+            echo "utc_tag=${utc_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.meta.outputs.registry }}:latest
+            ${{ steps.meta.outputs.registry }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.registry }}:${{ steps.meta.outputs.utc_tag }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+          # linux/amd64 first. Multi-arch comes later once every base is clean on arm64.
+          platforms: linux/amd64
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Prune GHCR package versions to last 3 tagged builds
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_NAME: ${{ matrix.name }}
+          KEEP_TAGGED: "3"
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          owner_type="$(gh api "users/${OWNER}" --jq .type)"
+          if [[ "$owner_type" == "Organization" ]]; then
+            api_root="/orgs/${OWNER}"
+          else
+            api_root="/users/${OWNER}"
+          fi
+
+          versions_json="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              --paginate \
+              "${api_root}/packages/container/${PACKAGE_NAME}/versions" \
+            || true
+          )"
+
+          if [[ -z "$versions_json" || "$versions_json" == "[]" ]]; then
+            echo "No package versions found for ${PACKAGE_NAME}. Skipping prune."
+            exit 0
+          fi
+
+          # Keep the newest KEEP_TAGGED versions that carry real tags
+          # (latest / sha-* / utc-*). Untagged rows are usually provenance/SBOM
+          # attestations from build-push-action; drop them when they are older
+          # than the oldest kept tagged build.
+          mapfile -t keep_tagged_ids < <(
+            jq -r --argjson keep "$KEEP_TAGGED" '
+              [ .[] | select((.metadata.container.tags // []) | length > 0) ]
+              | sort_by(.updated_at) | reverse
+              | .[:$keep]
+              | .[].id
+            ' <<<"$versions_json"
+          )
+
+          if [[ ${#keep_tagged_ids[@]} -eq 0 ]]; then
+            echo "No tagged versions for ${PACKAGE_NAME}. Skipping prune."
+            exit 0
+          fi
+
+          oldest_kept="$(
+            jq -r --argjson keep "$KEEP_TAGGED" '
+              [ .[] | select((.metadata.container.tags // []) | length > 0) ]
+              | sort_by(.updated_at) | reverse
+              | .[:$keep]
+              | last
+              | .updated_at
+            ' <<<"$versions_json"
+          )"
+
+          keep_ids_json="$(printf '%s\n' "${keep_tagged_ids[@]}" | jq -R . | jq -s 'map(tonumber)')"
+
+          echo "Keeping tagged version ids: ${keep_tagged_ids[*]}"
+          echo "Oldest kept tagged timestamp: ${oldest_kept}"
+
+          mapfile -t delete_ids < <(
+            jq -r --argjson keep_ids "$keep_ids_json" --arg oldest "$oldest_kept" '
+              .[]
+              | . as $v
+              | select(($keep_ids | index($v.id)) | not)
+              | select(
+                  (($v.metadata.container.tags // []) | length > 0)
+                  or ($v.updated_at < $oldest)
+                )
+              | $v.id
+            ' <<<"$versions_json"
+          )
+
+          if [[ ${#delete_ids[@]} -eq 0 ]]; then
+            echo "Nothing to prune."
+            exit 0
+          fi
+
+          for id in "${delete_ids[@]}"; do
+            echo "delete version id=${id}"
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "${api_root}/packages/container/${PACKAGE_NAME}/versions/${id}"
+          done
