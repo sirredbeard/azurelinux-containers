@@ -20,7 +20,7 @@ ARG DOTNET_SDK_IMAGE=mcr.microsoft.com/dotnet/sdk:11.0-preview
 FROM ${DOTNET_SDK_IMAGE}
 
 LABEL org.opencontainers.image.title="devolutions-terminal-build-container" \
-      org.opencontainers.image.description="Build container for Devolutions Terminal on Linux (NativeAOT, Ghostty/Zig natives, tar/deb/rpm/AppImage)." \
+      org.opencontainers.image.description="Build container for Devolutions Terminal on Linux (NativeAOT, Ghostty/Zig natives, GTK4/libadwaita, Qt6, tar/deb/rpm/AppImage)." \
       org.opencontainers.image.source="https://github.com/sirredbeard/azurelinux-containers" \
       org.opencontainers.image.url="https://github.com/sirredbeard/azurelinux-containers/tree/main/devolutions-terminal-build-container" \
       org.opencontainers.image.licenses="MIT" \
@@ -35,8 +35,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# NativeAOT, packaging, Ghostty/Zig restore (pwsh), and ARM64 cross publish.
+# NativeAOT, packaging, Ghostty/Zig restore (pwsh), ARM64 cross publish,
+# and native Linux shell frontends (GTK4/libadwaita now, Qt6 when that spike opens).
 # Zig itself is fetched by DT's Restore-NativeLibraries.ps1 on first build.
+# Gir.Core and Qt bridges need the C libraries and headers on the image, not only NuGet.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -68,6 +70,31 @@ RUN set -eux; \
       libssl-dev \
       libkrb5-dev \
       liblttng-ust-dev \
+      libglib2.0-dev \
+      libgirepository1.0-dev \
+      gobject-introspection \
+      libgtk-4-dev \
+      libadwaita-1-dev \
+      libgraphene-1.0-dev \
+      libcairo2-dev \
+      libpango1.0-dev \
+      libgdk-pixbuf-2.0-dev \
+      libwayland-dev \
+      libxkbcommon-dev \
+      gir1.2-glib-2.0 \
+      gir1.2-gtk-4.0 \
+      gir1.2-adw-1 \
+      qt6-base-dev \
+      qt6-base-dev-tools \
+      qt6-tools-dev \
+      qt6-tools-dev-tools \
+      qt6-wayland \
+      qt6-wayland-dev \
+      qt6-declarative-dev \
+      libqt6core6 \
+      libqt6gui6 \
+      libqt6widgets6 \
+      libqt6waylandclient6 \
       tar \
       gzip \
       xz-utils \
@@ -107,7 +134,8 @@ RUN set -eux; \
     rm -f /tmp/powershell.tar.gz; \
     pwsh -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
 
-# Confirm the floating SDK tag resolved to a usable toolchain.
+# Confirm the floating SDK tag resolved to a usable toolchain,
+# and that native shell pkg-config files are visible.
 RUN set -eux; \
     dotnet --info; \
     clang --version; \
@@ -117,7 +145,13 @@ RUN set -eux; \
     command -v mksquashfs; \
     command -v aarch64-linux-gnu-objcopy; \
     command -v desktop-file-validate; \
-    command -v appstreamcli
+    command -v appstreamcli; \
+    pkg-config --exists --print-errors gtk4; \
+    pkg-config --exists --print-errors libadwaita-1; \
+    pkg-config --exists --print-errors Qt6Core Qt6Gui Qt6Widgets; \
+    pkg-config --modversion gtk4; \
+    pkg-config --modversion libadwaita-1; \
+    pkg-config --modversion Qt6Core
 
 WORKDIR /src
 

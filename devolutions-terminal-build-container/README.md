@@ -17,6 +17,10 @@ Weekly rebuilds pull the floating preview tag from MCR, so the image tracks the 
 - packaging: `rpm` / `rpmbuild`, `squashfs-tools` / `mksquashfs`, `ar`
 - desktop metadata: `appstreamcli`, `desktop-file-validate`
 - ARM64 cross: `gcc-aarch64-linux-gnu`, `binutils-aarch64-linux-gnu`, `libc6-dev-arm64-cross`
+- GTK4 + libadwaita headers, runtime libs, and GObject introspection (Gir.Core shell)
+- Qt6 base / widgets / wayland / declarative dev packages (Plasma shell spike later)
+
+`pkg-config` must see `gtk4`, `libadwaita-1`, and `Qt6Core` / `Qt6Gui` / `Qt6Widgets` after the image builds. Image build fails closed if those modules are missing.
 
 Zig is not preinstalled. DT downloads the pinned Zig version on first native restore.
 
